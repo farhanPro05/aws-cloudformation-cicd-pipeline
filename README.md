@@ -139,3 +139,103 @@ This is the role's trust policy after I replaced the one the console wizard gene
 The workflow reads the role ARN and the Region from repository **variables**. The repository has no secrets.
 
 ![GitHub repository variables: AWS_REGION = us-west-2 and AWS_ROLE_ARN](screenshots/05-github-actions-variables.png)
+
+### 2. First push: the pipeline creates the stack
+
+I committed the template and the workflow together as `Add IaC and GitHub Actions automation` and pushed to `main`. That push was the whole deployment.
+
+![Repository files on GitHub after the first push, with the latest commit Add IaC and GitHub Actions automation](screenshots/06-github-repo-files.png)
+
+Run #1 passed every step: checkout, the OIDC sign-in, the identity check, validation, deployment and outputs. Creating the stack took 1 m 7 s of the job's 1 m 18 s.
+
+![GitHub Actions run #1, Add IaC and GitHub Actions automation: every step green](screenshots/07-actions-run1-success.png)
+
+The last deploy step prints the stack outputs, so the website URL is right there in the run log.
+
+![The Print website and infrastructure outputs step: VpcId, InstanceId, WebsiteURL and PublicIPAddress](screenshots/08-actions-run1-outputs.png)
+
+### 3. The stack in CloudFormation
+
+Stack `bongodev-github-iac-dev` reached **CREATE_COMPLETE**, created at 06:24:20. I never clicked Create stack; the workflow created it.
+
+![Stack bongodev-github-iac-dev with status CREATE_COMPLETE](screenshots/09-cfn-stack-create-complete.png)
+
+All **9 resources** in the template, each **CREATE_COMPLETE**.
+
+![Stack resources (9), all CREATE_COMPLETE](screenshots/10-cfn-stack-resources.png)
+
+The same 4 outputs the workflow printed.
+
+![Stack outputs: InstanceId, PublicIPAddress, VpcId and WebsiteURL](screenshots/11-cfn-stack-outputs.png)
+
+### 4. The server and the website
+
+The instance `bongodev-github-iac-dev-dev-nginx` (`i-01044f72bd5b1c30f`) is **running** as a `t3.micro` in the stack's VPC and subnet, with IMDSv2 required.
+
+![EC2 instance i-01044f72bd5b1c30f: Running, t3.micro, in the stack's VPC and public subnet](screenshots/12-ec2-instance-running.png)
+
+Its tags before the update: `Course` = `bongoDev-DevOps` and `Environment` = `dev`, plus its `Name` and the tags CloudFormation adds on its own.
+
+![Instance tags before the update: Course = bongoDev-DevOps, Environment = dev](screenshots/13-ec2-tags-before.png)
+
+The website, served by Nginx over plain HTTP from the instance's public IP. UserData installed and configured everything on first boot, and the `Environment: dev` line comes from the stack parameter.
+
+![The Nginx web page at the instance's public IP: Infrastructure as Code is working, Environment: dev](screenshots/14-nginx-website.png)
+
+### 5. Second push: an in-place update
+
+To prove that a Git change updates the existing infrastructure, I changed one line of the template, the instance's `Course` tag, and pushed again.
+
+![Commit Update EC2 Course tag through IaC: 1 file changed, the Course tag value on line 110](screenshots/15-github-commit-tag-change.png)
+
+Run #2 started on its own and passed in 48 seconds.
+
+![GitHub Actions run #2, Update EC2 Course tag through IaC: every step green](screenshots/16-actions-run2-success.png)
+
+Both runs in the workflow's history, each one started by a push to `main`.
+
+![Workflow runs: #2 Update EC2 Course tag through IaC and #1 Add IaC and GitHub Actions automation, both green, both on main](screenshots/17-actions-runs-list.png)
+
+The **same stack** moved to **UPDATE_COMPLETE**. Its created time is unchanged (06:24:20), and its updated time is 08:45:46.
+
+![Stack bongodev-github-iac-dev with status UPDATE_COMPLETE, created 06:24:20, updated 08:45:46](screenshots/18-cfn-stack-update-complete.png)
+
+The events show exactly what the update did. Only `UbuntuNginxServer` changed: **UPDATE_IN_PROGRESS** at 08:45:48 and **UPDATE_COMPLETE** at 08:45:52. Nothing was created or replaced, and the whole stack update took 8 seconds, from 08:45:46 to 08:45:54.
+
+![Stack events: the stack UPDATE_IN_PROGRESS, UbuntuNginxServer UPDATE_IN_PROGRESS then UPDATE_COMPLETE, then the stack UPDATE_COMPLETE](screenshots/19-cfn-stack-update-events.png)
+
+After the update, `Course` reads `bongoDev-DevOps-Homework-V2` on the **same instance**, `i-01044f72bd5b1c30f` (see [why the test changes a tag](#why-the-update-test-changes-a-tag-not-the-web-page)).
+
+![Instance tags after the update on the same instance i-01044f72bd5b1c30f, with the new Course value](screenshots/20-ec2-tags-after.png)
+
+### 6. Teardown
+
+I removed everything, in an order that keeps the pipeline from recreating anything partway through.
+
+1. **Disabled** the workflow, so no push could deploy the stack again.
+
+   ![Workflow Deploy Ubuntu Nginx with CloudFormation: This workflow was disabled manually](screenshots/21-actions-workflow-disabled.png)
+
+2. **Deleted** the stack in the console, with my own permissions, because the deploy role can't delete stacks. CloudFormation removed all 9 resources in dependency order.
+
+   ![Deleted stacks: bongodev-github-iac-dev with status DELETE_COMPLETE](screenshots/22-cleanup-stack-deleted.png)
+
+3. **Checked** that the instance was **terminated**.
+
+   ![EC2 instance i-01044f72bd5b1c30f: Terminated](screenshots/23-cleanup-ec2-terminated.png)
+
+4. **Checked** that the VPC was gone.
+
+   ![Your VPCs filtered by bongodev: No matching resource found](screenshots/24-cleanup-vpc-deleted.png)
+
+5. **Deleted** the IAM role.
+
+   ![IAM roles: Role deleted bongodev-github-iac-deploy-role, 0 matches for bongodev](screenshots/25-cleanup-iam-role-deleted.png)
+
+6. **Deleted** the deploy policy.
+
+   ![IAM policies: Policy deleted, 0 matches for bongodev](screenshots/26-cleanup-iam-policy-deleted.png)
+
+7. **Deleted** the GitHub OIDC identity provider, since nothing else in the account used it.
+
+   ![IAM identity providers: Identity provider deleted, Identity providers (0)](screenshots/27-cleanup-oidc-provider-deleted.png)
