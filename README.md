@@ -239,3 +239,90 @@ I removed everything, in an order that keeps the pipeline from recreating anythi
 7. **Deleted** the GitHub OIDC identity provider, since nothing else in the account used it.
 
    ![IAM identity providers: Identity provider deleted, Identity providers (0)](screenshots/27-cleanup-oidc-provider-deleted.png)
+
+---
+
+## Design decisions
+
+### GitHub Actions and CloudFormation: who does what
+
+**GitHub Actions** is the automation: it reacts to a push, runs the steps in `deploy.yml` on a fresh runner, and calls AWS with temporary credentials. **CloudFormation** is the deployment engine: it treats the template as the desired state, and creates, updates or deletes AWS resources until the stack matches it.
+
+So the template says *what* should exist, the workflow decides *when* to apply it, and CloudFormation works out *how*: the order of operations, the dependencies between resources, and what to roll back if a step fails.
+
+### Why a push can deploy without anyone signing in to AWS
+
+The workflow doesn't need a person's AWS login. It signs in as the IAM role itself, with the token GitHub issues to that job (see [OIDC](#security-oidc-and-least-privilege-iam)). Everything a person would otherwise click through in the console is written in the template, so the push carries the whole change. That also makes the Git history the change log for the infrastructure: every change is a reviewed diff with an author and a time. I only used the console for the one-time IAM setup, to check the results, and for the teardown.
+
+### Why OIDC instead of access keys
+
+- **Nothing to leak.** Access keys stored as GitHub secrets are long-lived. Anyone who gets hold of them, through a malicious action, a leaked log or a compromised account, keeps access until someone notices and rotates them. Here, no stored credential exists to steal.
+- **Short-lived.** Each job's credentials expire within an hour, and a new job has to ask again.
+- **Scoped by the trust policy.** Only this repository's `main` branch can assume the role. A workflow running on another branch or in a fork presents a different subject and is refused.
+- **Nothing to rotate**, and CloudTrail records every session under the role, with the session name `bongodev-iac-lab`.
+
+### The trust policy pins numeric IDs, not only names
+
+For repositories created since July 15, 2026, GitHub's token subject includes the owner's and the repository's numeric IDs: `repo:farhanPro05@121637943/aws-cloudformation-cicd-pipeline@1466988975:ref:refs/heads/main`.
+
+- **The console wizard writes the old format.** The IAM role wizard generates the older name-only subject, `repo:farhanPro05/aws-cloudformation-cicd-pipeline:ref:refs/heads/main`, which never matches this repository's tokens. So I replaced the generated trust policy with one that uses the IDs, based on [`iam/trust-policy-new-repos-2026.json`](iam/trust-policy-new-repos-2026.json).
+- **Names can be reused; IDs can't.** If this repository were renamed or deleted, a new repository created under the old name would get a different ID, and its tokens wouldn't match.
+- [`iam/trust-policy-legacy-repos.json`](iam/trust-policy-legacy-repos.json) keeps the name-only form for repositories created before that date.
+
+### Why a second push updates the same stack
+
+- **The stack name is fixed.** The workflow always deploys to `bongodev-github-iac-dev`, set in `deploy.yml`. `aws cloudformation deploy` checks whether that stack exists: the first run created it, and every later run updates it.
+- **Only the differences are applied.** On an update, CloudFormation compares the new template with the deployed one and builds a change set of only what changed. Resources are matched by logical ID, so `UbuntuNginxServer` in the new template *is* the running instance.
+- **A tag change doesn't interrupt the instance.** CloudFormation can change an EC2 instance's tags in place, so the instance kept its ID. Changing a property such as the AMI or the subnet would **replace** the instance instead, giving a new instance with a new ID and IP.
+- **No change is not a failure.** A deployment with nothing to change produces an empty change set, and `--no-fail-on-empty-changeset` makes that run succeed.
+
+### Why `CREATE_COMPLETE` doesn't mean Nginx is ready
+
+CloudFormation marks the instance complete once EC2 reports it **running**. The template has no `CreationPolicy`, so CloudFormation doesn't wait for anything inside the instance. The UserData script only starts at boot: it runs `apt-get update`, installs Nginx and writes the page, which takes another minute or two. Until then, the website URL in the outputs doesn't answer.
+
+The script itself is strict: it runs with `set -euxo pipefail`, tests the Nginx configuration, checks that the service is active, and logs everything to `/var/log/bongodev-bootstrap.log`. A failed bootstrap would show up there, but the stack wouldn't know about it. In production I'd make the stack wait for the application, with a `CreationPolicy` and a `cfn-signal` sent at the end of the script, or with a load balancer health check, so that `CREATE_COMPLETE` would mean the site actually serves traffic.
+
+### Why the update test changes a tag, not the web page
+
+- **UserData runs once.** The script runs on the instance's first boot only. Editing the HTML in the template would change the template, but not the page on the running instance.
+- **It would also disturb the instance.** Changing an instance's UserData makes CloudFormation stop and start it. The site would go down briefly and the instance would get a new public IP, and the page still wouldn't change.
+- **A tag is a clean test.** It's metadata: it updates without interrupting the instance, shows up right away in the console, and makes the in-place update easy to prove by comparing the Instance ID before and after.
+
+Real application changes belong in a deployment mechanism, such as SSM Run Command or CodeDeploy, or in replacing instances with new ones built from a new image.
+
+### Teardown: order matters, and the pipeline can't do it
+
+- **Disable the workflow first.** Otherwise, any later push that touches the template would quietly create the whole stack again.
+- **The deploy role can't delete stacks.** Destroying the environment is a deliberate human action, not something a compromised or buggy workflow can do, so I deleted the stack in the console with my own permissions.
+- **One delete removes everything.** Every resource belongs to the stack, so deleting it removed all 9 in the right dependency order. There were no orphaned subnets, gateways or security groups to hunt down.
+- **Then the account-level pieces:** the role, the policy and the OIDC provider. The provider serves every repository in the account, so it should only be deleted when nothing else uses it.
+
+### What I'd add for production
+
+- **Review before apply.** Create the change set on a pull request and execute it only after merge, with `main` protected and a GitHub environment that requires approval for production.
+- **Tighter IAM.** The deploy policy limits actions but allows them on any resource (`"Resource": "*"`). I'd scope it with resource tags and conditions, or give CloudFormation its own service role, so the GitHub role could only pass that role and manage change sets.
+- **Reproducible builds.** The SSM parameter always points to the *current* Ubuntu image, so two deployments a month apart can boot different AMIs. I'd pin the AMI, or bake my own, and pin the package versions.
+- **HTTPS, and no public instance.** I'd put the instance in a private subnet behind an Application Load Balancer with an ACM certificate.
+- **Checks in CI.** I'd run `cfn-lint`, and a policy check such as cfn-guard, before every deployment.
+
+---
+
+## Repository layout
+
+```text
+.
+├── README.md                     this document
+├── cloudformation.yaml           the stack: VPC, subnet, routing, security group, EC2 instance with Nginx
+├── .github/workflows/deploy.yml  the pipeline: OIDC sign-in, validate, deploy, print outputs
+├── iam/                          IAM templates (the account ID and repository IDs are placeholders)
+│   ├── deployment-policy-lab.json         the deploy role's permissions
+│   ├── trust-policy-new-repos-2026.json   trust policy with numeric IDs (repositories since July 2026)
+│   └── trust-policy-legacy-repos.json     trust policy with names only (older repositories)
+└── screenshots/                  the console screenshots used above
+```
+
+## Notes
+
+- **Time zone.** The times in the screenshots are local time, **UTC+6**.
+- **Naming.** The AWS resource names (`bongodev-…`), the web page text and the `Course` tag values come from the starter template, and I kept them unchanged.
+- **Credits.** The CloudFormation template, the GitHub Actions workflow and the IAM policy templates came from cloud-course starter files. I built and ran everything else: the GitHub repository, the OIDC trust between GitHub and AWS, the IAM setup, both deployments, the verification and the teardown.
